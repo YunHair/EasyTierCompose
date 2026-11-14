@@ -129,7 +129,7 @@ android {
             // ndk.abiFilters, so the ABI list is declared here explicitly.
             isEnable = true
             reset()
-            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            include("arm64-v8a")
             isUniversalApk = false
         }
     }

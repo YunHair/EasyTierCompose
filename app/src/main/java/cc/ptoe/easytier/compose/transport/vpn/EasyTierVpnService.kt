@@ -103,6 +103,15 @@ class EasyTierVpnService : VpnService() {
         } else if (hasDefaultRoute) {
             builder.addDnsServer(FALLBACK_DNS)
         }
+        if (hasDefaultRoute) {
+            // 出口节点模式下同时接管 IPv6：只装 0.0.0.0/0 时，手机的蜂窝/Wi-Fi 原生
+            // IPv6 完全不经过隧道，查 IP 会暴露本机 IPv6。注意 EasyTier 内置 NAT
+            // （smoltcp）目前只支持 IPv4，v6 能否真正从出口节点出去取决于出口节点
+            // 是否配置了内核转发 + ip6tables MASQUERADE（proxy_forward_by_system）；
+            // 未配置时 IPv6 会在隧道内被丢弃，应用自动回退 IPv4（仍走出口节点），
+            // 但不会再泄漏本机 IPv6。
+            builder.addRoute(IPV6_DEFAULT_ROUTE, 0)
+        }
         builder.addDisallowedApplication(packageName)
         Log.i(TAG, "createInterface: cidr=$ipv4Cidr mtu=$mtu routes=${routes.size} added=$added dns=$dns")
         return builder.establish() ?: error(getString(R.string.error_vpn_establish_failed))
@@ -155,6 +164,7 @@ class EasyTierVpnService : VpnService() {
         private const val MAGIC_DNS = "100.100.100.101"
         private const val FALLBACK_DNS = "223.5.5.5"
         private const val DEFAULT_ROUTE_V4 = "0.0.0.0/0"
+        private const val IPV6_DEFAULT_ROUTE = "::"
 
         fun intent(context: Context, instanceName: String, ipv4Cidr: String, routes: List<String>, dns: Boolean, mtu: Int) =
             Intent(context, EasyTierVpnService::class.java)
