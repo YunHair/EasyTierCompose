@@ -55,6 +55,9 @@ class EasyTierRuntimeCoordinator private constructor(
     companion object {
         private const val TAG = "EasyTierCoordinator"
 
+        // 出口节点模式下为 VpnService 补的默认路由（见 routesWithExitNode）。
+        private const val DEFAULT_ROUTE_V4 = "0.0.0.0/0"
+
         // Process-wide singleton: BootCompletedReceiver and MainActivity must share one
         // coordinator. Two instances would each run their own poll loops and transports
         // against the same global native instance / root daemon, so a stop() from the
@@ -189,7 +192,7 @@ class EasyTierRuntimeCoordinator private constructor(
                 pollNoTun()
             }
             TunMode.VPN_SERVICE -> {
-                val status = vpn.adopt(profile, info?.virtualIpv4, info?.routes.orEmpty())
+                val status = vpn.adopt(profile, info?.virtualIpv4, profile.routesWithExitNode(info?.routes.orEmpty()))
                 mutableStatus.value = status
                 if (status.state == RuntimeState.RUNNING || status.state == RuntimeState.STARTING) pollVpn()
             }
@@ -305,7 +308,7 @@ class EasyTierRuntimeCoordinator private constructor(
                         return@launch
                     }
                     if (!info.virtualIpv4.isNullOrBlank()) {
-                        val status = vpn.establishWhenResolved(profile, info.virtualIpv4, info.routes)
+                        val status = vpn.establishWhenResolved(profile, info.virtualIpv4, profile.routesWithExitNode(info.routes))
                         mutableStatus.value = status.copy(peers = info.peers, hostname = info.hostname, natType = info.natType)
                     } else {
                         mutableStatus.value = mutableStatus.value.copy(hostname = info.hostname, natType = info.natType)
@@ -375,6 +378,22 @@ class EasyTierRuntimeCoordinator private constructor(
 
     private fun failure(profile: EasyTierProfile, error: String): RuntimeStatus =
         RuntimeStatus(RuntimeState.ERROR, profile.id, profile.tunMode, null, null, error).also { mutableStatus.value = it }
+
+    /**
+     * EasyTier 的 exit_nodes 只是 core 数据面的“兜底下一跳”：只有当报文已经进入 TUN、
+     * 且目的地址不在虚拟网段/已知路由中时，才会被交给出口节点。它本身不会产生任何路由
+     * 条目，所以不会出现在 [NetworkInfo.routes]（那里只有对端通告的 proxy_cidrs 子网代理）。
+     *
+     * 免 root 的 VpnService 路由完全由 App 通过 Builder.addRoute 决定，因此配置了出口节点
+     * 却不补默认路由时，上网流量根本不会进隧道，出口节点永远收不到包（表现为查 IP 仍是本机 IP）。
+     * 这里在 exit_nodes 非空且对端未通告 0.0.0.0/0 时补一条默认路由，行为对齐 Tailscale 的
+     * exit node：选中出口节点即接管全部 IPv4 流量。
+     */
+    private fun EasyTierProfile.routesWithExitNode(routes: List<String>): List<String> {
+        if (exitNodes.none { it.isNotBlank() }) return routes
+        if (routes.any { it.trim() == DEFAULT_ROUTE_V4 }) return routes
+        return routes + DEFAULT_ROUTE_V4
+    }
 
     private fun nativeError(@StringRes fallbackRes: Int) = EasyTierJni.getLastError() ?: context.getString(fallbackRes)
 }

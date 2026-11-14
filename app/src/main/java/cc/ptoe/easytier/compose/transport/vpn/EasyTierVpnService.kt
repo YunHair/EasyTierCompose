@@ -94,7 +94,15 @@ class EasyTierVpnService : VpnService() {
                 Log.w(TAG, "createInterface: skipping invalid route '$route': ${e.message}")
             }
         }
-        if (dns) builder.addDnsServer(MAGIC_DNS)
+        // 出口节点模式下装的是 0.0.0.0/0 默认路由。此时若不开 Magic DNS，Android 会把底层
+        // 网络的 DNS（多为 192.168.x.1 这类内网网关）当作 VPN 的解析器，出口节点侧根本回不去，
+        // 表现为“隧道通了但网页打不开”。这里退回到会随隧道一起走的公共 DNS。
+        val hasDefaultRoute = routes.any { it.trim() == DEFAULT_ROUTE_V4 }
+        if (dns) {
+            builder.addDnsServer(MAGIC_DNS)
+        } else if (hasDefaultRoute) {
+            builder.addDnsServer(FALLBACK_DNS)
+        }
         builder.addDisallowedApplication(packageName)
         Log.i(TAG, "createInterface: cidr=$ipv4Cidr mtu=$mtu routes=${routes.size} added=$added dns=$dns")
         return builder.establish() ?: error(getString(R.string.error_vpn_establish_failed))
@@ -145,6 +153,8 @@ class EasyTierVpnService : VpnService() {
         private const val CHANNEL_ID = "easytier_vpn"
         private const val NOTIFICATION_ID = 1001
         private const val MAGIC_DNS = "100.100.100.101"
+        private const val FALLBACK_DNS = "223.5.5.5"
+        private const val DEFAULT_ROUTE_V4 = "0.0.0.0/0"
 
         fun intent(context: Context, instanceName: String, ipv4Cidr: String, routes: List<String>, dns: Boolean, mtu: Int) =
             Intent(context, EasyTierVpnService::class.java)
