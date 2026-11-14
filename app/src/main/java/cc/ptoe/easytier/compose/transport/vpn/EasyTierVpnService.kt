@@ -28,10 +28,11 @@ class EasyTierVpnService : VpnService() {
         val routes = command.getStringArrayExtra(EXTRA_ROUTES)?.map { it }.orEmpty().toTypedArray()
         val dns = command.getBooleanExtra(EXTRA_DNS, false)
         val mtu = command.getIntExtra(EXTRA_MTU, 1380)
-        Log.i(TAG, "onStartCommand: instance=$instanceName cidr=$ipv4Cidr routes=${routes.size} dns=$dns mtu=$mtu")
+        val disableIpv6 = command.getBooleanExtra(EXTRA_DISABLE_IPV6, false)
+        Log.i(TAG, "onStartCommand: instance=$instanceName cidr=$ipv4Cidr routes=${routes.size} dns=$dns mtu=$mtu disableIpv6=$disableIpv6")
         vpnInterface?.close()
         vpnInterface = try {
-            createInterface(ipv4Cidr, routes, dns, mtu)
+            createInterface(ipv4Cidr, routes, dns, mtu, disableIpv6)
         } catch (e: Exception) {
             Log.e(TAG, "createInterface failed: ${e.message}", e)
             return stopAndExit(startId, "createInterface: ${e.message}")
@@ -72,7 +73,7 @@ class EasyTierVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun createInterface(ipv4Cidr: String, routes: Array<String>, dns: Boolean, mtu: Int): ParcelFileDescriptor {
+    private fun createInterface(ipv4Cidr: String, routes: Array<String>, dns: Boolean, mtu: Int, disableIpv6: Boolean): ParcelFileDescriptor {
         val (address, prefix) = ipv4Cidr.parseCidr()
         val builder = Builder()
             .setSession(getString(R.string.vpn_session_name))
@@ -103,17 +104,22 @@ class EasyTierVpnService : VpnService() {
         } else if (hasDefaultRoute) {
             builder.addDnsServer(FALLBACK_DNS)
         }
-        if (hasDefaultRoute) {
-            // 出口节点模式下同时接管 IPv6：只装 0.0.0.0/0 时，手机的蜂窝/Wi-Fi 原生
-            // IPv6 完全不经过隧道，查 IP 会暴露本机 IPv6。注意 EasyTier 内置 NAT
-            // （smoltcp）目前只支持 IPv4，v6 能否真正从出口节点出去取决于出口节点
-            // 是否配置了内核转发 + ip6tables MASQUERADE（proxy_forward_by_system）；
-            // 未配置时 IPv6 会在隧道内被丢弃，应用自动回退 IPv4（仍走出口节点），
-            // 但不会再泄漏本机 IPv6。
+        // IPv6 接管策略：
+        // 1) 配置里关闭「启用 IPv6」→ 整机禁用：把 ::/0 收进隧道并丢弃，
+        //    对应用而言 IPv6 完全不可用（Android 不允许非 root 应用移除蜂窝
+        //    网卡的 IPv6 地址，接管+黑洞是等效手段），所有流量强制走 IPv4。
+        // 2) 出口节点默认路由（0.0.0.0/0）存在 → 同样接管 ::/0，防止原生
+        //    IPv6 绕过隧道泄漏本机地址。EasyTier 内置 NAT 仅支持 IPv4，v6
+        //    在隧道内被丢弃后应用回退 IPv4；出口节点配置了内核转发 +
+        //    ip6tables MASQUERADE（proxy_forward_by_system）时 v6 才会真正
+        //    从出口节点出去。
+        val disableIpv6Effective = disableIpv6 || hasDefaultRoute
+        if (disableIpv6Effective) {
             builder.addRoute(IPV6_DEFAULT_ROUTE, 0)
+            Log.i(TAG, "createInterface: IPv6 captured into tunnel (::/0), disableIpv6=$disableIpv6 exitNodeMode=$hasDefaultRoute")
         }
         builder.addDisallowedApplication(packageName)
-        Log.i(TAG, "createInterface: cidr=$ipv4Cidr mtu=$mtu routes=${routes.size} added=$added dns=$dns")
+        Log.i(TAG, "createInterface: cidr=$ipv4Cidr mtu=$mtu routes=${routes.size} added=$added dns=$dns disableIpv6=$disableIpv6Effective")
         return builder.establish() ?: error(getString(R.string.error_vpn_establish_failed))
     }
 
@@ -159,6 +165,7 @@ class EasyTierVpnService : VpnService() {
         const val EXTRA_ROUTES = "cc.ptoe.easytier.compose.ROUTES"
         const val EXTRA_DNS = "cc.ptoe.easytier.compose.DNS"
         const val EXTRA_MTU = "cc.ptoe.easytier.compose.MTU"
+        const val EXTRA_DISABLE_IPV6 = "cc.ptoe.easytier.compose.DISABLE_IPV6"
         private const val CHANNEL_ID = "easytier_vpn"
         private const val NOTIFICATION_ID = 1001
         private const val MAGIC_DNS = "100.100.100.101"
@@ -166,12 +173,13 @@ class EasyTierVpnService : VpnService() {
         private const val DEFAULT_ROUTE_V4 = "0.0.0.0/0"
         private const val IPV6_DEFAULT_ROUTE = "::"
 
-        fun intent(context: Context, instanceName: String, ipv4Cidr: String, routes: List<String>, dns: Boolean, mtu: Int) =
+        fun intent(context: Context, instanceName: String, ipv4Cidr: String, routes: List<String>, dns: Boolean, mtu: Int, disableIpv6: Boolean) =
             Intent(context, EasyTierVpnService::class.java)
                 .putExtra(EXTRA_INSTANCE_NAME, instanceName)
                 .putExtra(EXTRA_IPV4_CIDR, ipv4Cidr)
                 .putExtra(EXTRA_ROUTES, routes.toTypedArray())
                 .putExtra(EXTRA_DNS, dns)
                 .putExtra(EXTRA_MTU, mtu)
+                .putExtra(EXTRA_DISABLE_IPV6, disableIpv6)
     }
 }

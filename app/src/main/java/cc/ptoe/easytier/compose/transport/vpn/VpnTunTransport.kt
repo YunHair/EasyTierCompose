@@ -93,7 +93,9 @@ class VpnTunTransport(
         establishedRoutes = routes
         ContextCompat.startForegroundService(
             context,
-            EasyTierVpnService.intent(context, profile.id, ipv4Cidr, routes, profile.enableMagicDns, activeMtu),
+            // 「启用 IPv6」关闭时整机禁用 IPv6（::/0 收进隧道丢弃）；开启时若处于
+            // 出口节点模式，VpnService 内部也会按默认路由自动接管 IPv6。
+            EasyTierVpnService.intent(context, profile.id, ipv4Cidr, routes, profile.enableMagicDns, activeMtu, !profile.enableIpv6),
         )
         return RuntimeStatus(RuntimeState.RUNNING, profile.id, profile.tunMode, ipv4Cidr, context.getString(R.string.vpn_device_name), null)
             .also { mutableStatus.value = it }
