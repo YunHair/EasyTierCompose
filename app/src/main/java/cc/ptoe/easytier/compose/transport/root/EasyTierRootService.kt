@@ -238,7 +238,9 @@ class EasyTierRootService : RootService() {
         tunDescriptor?.close()
         tunDescriptor = null
         tunFd = -1
-        runCatching { EasyTierJni.retainNetworkInstance(null) }
+        // retainNetworkInstance(null) 在 native 层等价于 "保留全部"（不会停止实例），
+        // 必须传一个不存在的实例名才会真正停掉实例，否则 TUN fd 泄漏、路由残留。
+        runCatching { EasyTierJni.retainNetworkInstance(arrayOf("__easytier_stopped__")) }
         routeManager?.cleanupRoutesAndRules()
         execRoot("ip link del $tunDevName 2>/dev/null")
         dnsManager.restore()

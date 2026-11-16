@@ -325,6 +325,7 @@ fun EasyTierApp(
                                 connect = viewModel::connect,
                                 disconnect = viewModel::disconnect,
                                 onCreate = { viewModel.beginCreate(); destination = Destination.Editor },
+                                setExitNode = viewModel::setExitNode,
                             )
                             Destination.Profiles -> ProfilesScreen(
                                 state = state,

@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Build
 import android.provider.Settings
 import cc.ptoe.easytier.compose.data.EasyTierProfile
+import cc.ptoe.easytier.compose.data.ExitNodeCandidate
 import cc.ptoe.easytier.compose.data.RuntimePeer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -29,6 +30,8 @@ data class NetworkInfo(
      * to null; callers decide whether that is fatal.
      */
     val running: Boolean?,
+    /** 出口节点候选（含是否自我通告 0.0.0.0/0）。 */
+    val exitNodeCandidates: List<ExitNodeCandidate> = emptyList(),
 )
 
 /** Parses the JSON returned by [EasyTierJni.collectNetworkInfos] for a specific profile instance. */
@@ -52,7 +55,20 @@ fun String.networkInfo(profileId: String): NetworkInfo? = runCatching {
         } ?: emptyList()
     }?.distinct()?.sorted() ?: emptyList()
     val peers = info["peer_route_pairs"]?.jsonArray?.mapNotNull { it.peerRoutePair() }.orEmpty()
-    NetworkInfo(virtual, routes, error, peers, hostname, natType, running)
+    // 出口节点候选：每个 route 条目代表一个节点，proxy_cidrs 里出现 0.0.0.0/0
+    // 说明它把整个 IPv4 互联网当作子网代理通告（即方案 A 式的真出口节点）。
+    val exitNodeCandidates = (info["routes"] as? JsonArray)?.mapNotNull { element ->
+        val route = element.jsonObject
+        val ipv4 = route["ipv4_addr"]?.jsonObject?.let(::ipv4InetToCidr)?.substringBefore('/') ?: return@mapNotNull null
+        if (ipv4 == virtual?.substringBefore('/')) return@mapNotNull null
+        val hostname = route["hostname"]?.jsonPrimitive?.content?.ifBlank { null } ?: ipv4
+        val advertises = (route["proxy_cidrs"] as? JsonArray)
+            ?.any { it.jsonPrimitive.content.trim() == "0.0.0.0/0" } == true
+        ExitNodeCandidate(hostname = hostname, virtualIpv4 = ipv4, advertisesDefaultRoute = advertises)
+    }?.distinctBy { it.virtualIpv4 }
+        ?.sortedWith(compareByDescending<ExitNodeCandidate> { it.advertisesDefaultRoute }.thenBy { it.hostname })
+        ?: emptyList()
+    NetworkInfo(virtual, routes, error, peers, hostname, natType, running, exitNodeCandidates)
 }.getOrNull()
 
 // peer_route_pairs entries combine a Route (hostname, ipv4, cost, latency, NAT) with a Peer

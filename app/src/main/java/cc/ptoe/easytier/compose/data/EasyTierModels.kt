@@ -464,6 +464,20 @@ data class RuntimePeer(
 )
 
 /**
+ * 网络中的一个出口节点候选。
+ *
+ * EasyTier 没有在协议层暴露「我是出口节点」这个标记（api_instance.Route 无此字段），
+ * 所以候选来自两条线索：
+ *  1. 该节点把 0.0.0.0/0 作为子网代理通告（[advertisesDefaultRoute] = true，确定是出口）；
+ *  2. 其余在线节点（可能配置了 [flags] enable_exit_node，只能靠用户自行判断）。
+ */
+data class ExitNodeCandidate(
+    val hostname: String,
+    val virtualIpv4: String,
+    val advertisesDefaultRoute: Boolean,
+)
+
+/**
  * Snapshot of the WireGuard VPN portal exposed by a running EasyTier instance
  * (VpnPortalRpc.GetVpnPortalInfo). [clientConfig] is the WireGuard client
  * config rendered by EasyTier Core; [connectedClients] lists portal client
@@ -487,6 +501,8 @@ data class RuntimeStatus(
     val hostname: String? = null,
     val natType: String? = null,
     val wireguardPortal: WireGuardPortalInfo? = null,
+    /** 本网络中可作为出口节点的候选（来自 peer 路由表，见 ExitNodeCandidate）。 */
+    val exitNodeCandidates: List<ExitNodeCandidate> = emptyList(),
 ) {
     companion object {
         val Stopped = RuntimeStatus(RuntimeState.STOPPED, null, null, null, null, null)

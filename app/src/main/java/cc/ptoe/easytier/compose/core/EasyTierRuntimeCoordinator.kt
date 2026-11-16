@@ -58,6 +58,10 @@ class EasyTierRuntimeCoordinator private constructor(
         // 出口节点模式下为 VpnService 补的默认路由（见 routesWithExitNode）。
         private const val DEFAULT_ROUTE_V4 = "0.0.0.0/0"
 
+        // 传给 retainNetworkInstance 的哨兵名：一个必然不存在的实例名，
+        // 用来避开 native 层 "null => 保留全部" 的语义（见 stopNativeInstances）。
+        private const val STOP_SENTINEL = "__easytier_stopped__"
+
         // Process-wide singleton: BootCompletedReceiver and MainActivity must share one
         // coordinator. Two instances would each run their own poll loops and transports
         // against the same global native instance / root daemon, so a stop() from the
@@ -170,7 +174,7 @@ class EasyTierRuntimeCoordinator private constructor(
         val profileId = entry.key
         val profile = profileLookup(profileId) ?: run {
             // Instance running but profile deleted — release it so it doesn't linger.
-            EasyTierJni.retainNetworkInstance(null)
+            stopNativeInstances()
             return@withLock
         }
         activeProfile = profile
@@ -205,7 +209,7 @@ class EasyTierRuntimeCoordinator private constructor(
     }
 
     private suspend fun startVpn(profile: EasyTierProfile, toml: String, globalSettings: GlobalSettings): RuntimeStatus = try {
-        EasyTierJni.retainNetworkInstance(null)
+        stopNativeInstances()
         require(EasyTierJni.runNetworkInstance(toml) == 0) { nativeError(R.string.error_easytier_start_failed) }
         vpn.start(profile, toml, globalSettings).also {
             mutableStatus.value = it
@@ -219,7 +223,7 @@ class EasyTierRuntimeCoordinator private constructor(
         throw cancellation
     } catch (error: Throwable) {
         vpn.stop()
-        runCatching { EasyTierJni.retainNetworkInstance(null) }
+        stopNativeInstances()
         failure(profile, error.message ?: nativeError(R.string.error_easytier_start_failed))
     }
 
@@ -237,7 +241,7 @@ class EasyTierRuntimeCoordinator private constructor(
      * establishWhenResolved() or root.setTunFd(), leaving the system without a TUN.
      */
     private suspend fun startNoTun(profile: EasyTierProfile, toml: String): RuntimeStatus = try {
-        EasyTierJni.retainNetworkInstance(null)
+        stopNativeInstances()
         require(EasyTierJni.runNetworkInstance(toml) == 0) { nativeError(R.string.error_easytier_start_failed) }
         mutableStatus.value = RuntimeStatus(RuntimeState.RUNNING, profile.id, profile.tunMode, null, null, null)
         pollNoTun()
@@ -249,7 +253,7 @@ class EasyTierRuntimeCoordinator private constructor(
         // attachRunningInstance().
         throw cancellation
     } catch (error: Throwable) {
-        runCatching { EasyTierJni.retainNetworkInstance(null) }
+        stopNativeInstances()
         failure(profile, error.message ?: nativeError(R.string.error_easytier_start_failed))
     }
 
@@ -267,12 +271,15 @@ class EasyTierRuntimeCoordinator private constructor(
             // daemon and are stopped via root.stop() below.
             TunMode.NO_TUN -> {
                 mutableStatus.value = mutableStatus.value.copy(state = RuntimeState.STOPPING)
-                runCatching { EasyTierJni.retainNetworkInstance(null) }
+                stopNativeInstances()
             }
             TunMode.VPN_SERVICE -> {
                 mutableStatus.value = mutableStatus.value.copy(state = RuntimeState.STOPPING)
+                // 必须先停 native 实例：它持有 VpnService TUN fd 的副本，
+                // 只关 Java 侧 ParcelFileDescriptor 不会让接口消失。
+                stopNativeInstances()
+                ensureNativeStopped(profile)
                 vpn.stop()
-                runCatching { EasyTierJni.retainNetworkInstance(null) }
             }
             TunMode.ROOT_TUN -> root.stop()
             null -> return mutableStatus.value.takeIf { it.state == RuntimeState.STOPPED } ?: RuntimeStatus.Stopped
@@ -297,19 +304,24 @@ class EasyTierRuntimeCoordinator private constructor(
                     Log.w(TAG, "core for profile ${profile.id} is gone; tearing down VPN")
                     failure(profile, context.getString(R.string.error_core_stopped))
                     vpn.stop()
-                    runCatching { EasyTierJni.retainNetworkInstance(null) }
+                    stopNativeInstances()
                     return@launch
                 }
                 if (info != null) {
                     if (!info.error.isNullOrBlank()) {
                         failure(profile, info.error)
                         vpn.stop()
-                        EasyTierJni.retainNetworkInstance(null)
+                        stopNativeInstances()
                         return@launch
                     }
                     if (!info.virtualIpv4.isNullOrBlank()) {
                         val status = vpn.establishWhenResolved(profile, info.virtualIpv4, profile.routesWithExitNode(info.routes))
-                        mutableStatus.value = status.copy(peers = info.peers, hostname = info.hostname, natType = info.natType)
+                        mutableStatus.value = status.copy(
+                            peers = info.peers,
+                            hostname = info.hostname,
+                            natType = info.natType,
+                            exitNodeCandidates = info.exitNodeCandidates,
+                        )
                     } else {
                         mutableStatus.value = mutableStatus.value.copy(hostname = info.hostname, natType = info.natType)
                     }
@@ -353,7 +365,7 @@ class EasyTierRuntimeCoordinator private constructor(
                 if (exitDetector.onPoll(info)) {
                     Log.w(TAG, "core for profile ${profile.id} is gone; clearing no-tun session")
                     failure(profile, context.getString(R.string.error_core_stopped))
-                    runCatching { EasyTierJni.retainNetworkInstance(null) }
+                    stopNativeInstances()
                     return@launch
                 }
                 // No TUN to establish: just surface runtime metadata for the UI.
@@ -393,6 +405,45 @@ class EasyTierRuntimeCoordinator private constructor(
         if (exitNodes.none { it.isNotBlank() }) return routes
         if (routes.any { it.trim() == DEFAULT_ROUTE_V4 }) return routes
         return routes + DEFAULT_ROUTE_V4
+    }
+
+
+    /**
+     * 真正停止 in-process 的 EasyTier 实例。
+     *
+     * 关键坑：JNI 的 retainNetworkInstance(null) 在 native 层会走 "retain_all" 分支
+     * （空数组/ null => 全部保留），并不会停止任何实例。实例会继续持有 VpnService
+     * TUN fd 的副本，断开连接后 VPN 接口依旧挂着 0.0.0.0/0 默认路由，所有流量被
+     * 黑洞 —— 表现为"断开后整机断网，只有杀掉 App 进程才恢复"。
+     *
+     * 这里传一个不存在的实例名，强制走"保留列表、停止其余"分支，把实例真正停掉。
+     */
+    private fun stopNativeInstances() {
+        runCatching { EasyTierJni.retainNetworkInstance(arrayOf(STOP_SENTINEL)) }
+            .onFailure { Log.w(TAG, "stopNativeInstances failed: ${it.message}") }
+    }
+
+    /**
+     * 校验实例确实已停止。若重试后仍在运行（TUN fd 仍被持有 -> 会持续黑洞流量），
+     * 结束本进程兜底释放所有 fd，避免手机持续断网（这也是用户唯一可行的自救手段）。
+     */
+    private suspend fun ensureNativeStopped(profile: EasyTierProfile) {
+        repeat(4) { attempt ->
+            val alive = runCatching { EasyTierJni.collectNetworkInfos(1)?.networkInfo(profile.id) }
+                .getOrNull() != null
+            if (!alive) return
+            Log.w(TAG, "instance ${profile.id} still alive after stop (attempt ${attempt + 1})")
+            stopNativeInstances()
+            delay(300)
+        }
+        // 只有"出口节点模式"才存在整机断网风险（默认路由仍指向已死的 TUN）；
+        // 普通模式的残留实例最多影响虚拟网段，不必付出杀进程的代价。
+        if (profile.exitNodes.any { it.isNotBlank() }) {
+            Log.e(TAG, "instance ${profile.id} refuses to stop; killing process to release TUN fd")
+            android.os.Process.killProcess(android.os.Process.myPid())
+        } else {
+            Log.e(TAG, "instance ${profile.id} still running after stop; leaving it (no default route installed)")
+        }
     }
 
     private fun nativeError(@StringRes fallbackRes: Int) = EasyTierJni.getLastError() ?: context.getString(fallbackRes)

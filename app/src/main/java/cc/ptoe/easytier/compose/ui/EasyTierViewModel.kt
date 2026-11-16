@@ -147,6 +147,25 @@ class EasyTierViewModel(
         globalSettingsRepository.update(settings)
     }
 
+    /**
+     * 首屏切换出口节点（热重载）：写回 profile 的 exit_nodes，运行中则立即重建隧道，
+     * 无需用户手动断开重连。传 null 表示不使用出口节点。
+     */
+    fun setExitNode(virtualIpv4: String?) = viewModelScope.launch {
+        val profile = selectedProfile() ?: return@launch
+        val nodes = listOfNotNull(virtualIpv4?.trim()?.takeIf { it.isNotEmpty() })
+        if (nodes == profile.exitNodes) return@launch
+        val updated = profile.copy(exitNodes = nodes)
+        repository.save(updated)
+        draft.value = draft.value?.takeIf { it.id == updated.id }?.copy(exitNodes = nodes)
+        val runtime = state.value.runtime
+        if (runtime.profileId == updated.id && runtime.state in setOf(RuntimeState.STARTING, RuntimeState.RUNNING)) {
+            Log.i(TAG, "setExitNode: hot-reloading tunnel with exit nodes $nodes")
+            coordinator.stop()
+            coordinator.start(updated, globalSettings.value)
+        }
+    }
+
     fun connect() = viewModelScope.launch { selectedProfile()?.let { coordinator.start(it, globalSettings.value) } }
     fun disconnect() = viewModelScope.launch { coordinator.stop() }
     fun resetProfiles() = viewModelScope.launch { coordinator.stop(); repository.reset(); selectedId.value = null }

@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">EasyTier</string>
+    <string name="app_name">EasyTier Plus</string>
 
     <string name="nav_dashboard">Dashboard</string>
     <string name="nav_profiles">Profiles</string>
@@ -55,6 +55,12 @@
 
     <string name="dashboard_click_create_profile">Click to create a profile</string>
     <string name="dashboard_click_disconnect">Click to disconnect</string>
+    <string name="dashboard_exit_node">Exit node</string>
+    <string name="dashboard_exit_node_none">None (direct internet)</string>
+    <string name="dashboard_exit_node_change">Change</string>
+    <string name="dashboard_exit_node_advertised">exit node</string>
+    <string name="dashboard_exit_node_manual">manual / not advertised</string>
+    <string name="dashboard_exit_node_empty">No peers discovered yet — connect first</string>
     <string name="dashboard_click_connect">Click to connect</string>
     <string name="dashboard_no_profile">No profile selected</string>
     <string name="detail_network">Network</string>
@@ -432,10 +438,10 @@
     <string name="error_vpn_permission_denied">VPN permission denied</string>
     <string name="error_core_stopped">EasyTier core exited unexpectedly</string>
     <string name="vpn_device_name">Android VPN</string>
-    <string name="vpn_session_name">EasyTier</string>
-    <string name="vpn_notification_title">EasyTier VPN active</string>
-    <string name="vpn_notification_text">EasyTier is routing through Android VPN</string>
-    <string name="vpn_notification_channel">EasyTier VPN</string>
-    <string name="fgs_special_use_subtype">EasyTier virtual network transport</string>
+    <string name="vpn_session_name">EasyTier Plus</string>
+    <string name="vpn_notification_title">EasyTier Plus VPN active</string>
+    <string name="vpn_notification_text">EasyTier Plus is routing through Android VPN</string>
+    <string name="vpn_notification_channel">EasyTier Plus VPN</string>
+    <string name="fgs_special_use_subtype">EasyTier Plus virtual network transport</string>
     <string name="error_vpn_establish_failed">Failed to establish EasyTier VPN</string>
 </resources>

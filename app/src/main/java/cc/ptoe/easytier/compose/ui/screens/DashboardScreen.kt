@@ -52,11 +52,13 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import cc.ptoe.easytier.compose.core.toV2rayShareLink
 import cc.ptoe.easytier.compose.R
+import cc.ptoe.easytier.compose.data.ExitNodeCandidate
 import cc.ptoe.easytier.compose.data.RuntimeState
 import cc.ptoe.easytier.compose.data.RuntimeStatus
 import cc.ptoe.easytier.compose.data.WireGuardPortalInfo
 import cc.ptoe.easytier.compose.ui.EasyTierUiState
 import cc.ptoe.easytier.compose.ui.components.SettingsGroup
+import cc.ptoe.easytier.compose.ui.components.SettingsItem
 import kotlinx.coroutines.delay
 
 @Composable
@@ -65,6 +67,7 @@ internal fun DashboardScreen(
     connect: () -> Unit,
     disconnect: () -> Unit,
     onCreate: () -> Unit,
+    setExitNode: (String?) -> Unit,
 ) {
     val profile = state.profiles.firstOrNull { it.id == state.selectedProfileId }
     val active = state.runtime.state in setOf(RuntimeState.STARTING, RuntimeState.RUNNING)
@@ -106,11 +109,102 @@ internal fun DashboardScreen(
             )
         }
 
+        item {
+            ExitNodeCard(
+                current = profile?.exitNodes?.firstOrNull()?.takeIf { it.isNotBlank() },
+                candidates = state.runtime.exitNodeCandidates,
+                enabled = profile != null,
+                onSelect = setExitNode,
+            )
+        }
+
         if (profile?.vpnPortal != null && active) {
             item {
                 WireGuardPortalCard(
                     portal = state.runtime.wireguardPortal,
                     remark = profile.name,
+                )
+            }
+        }
+    }
+}
+
+
+/**
+ * 首屏出口节点选择器：自动列出当前网络中的节点（自我通告 0.0.0.0/0 的会在副标题里标注），
+ * 选择后立即写回 profile 并在运行中热重载隧道，无需手动断开重连。
+ */
+@Composable
+private fun ExitNodeCard(
+    current: String?,
+    candidates: List<ExitNodeCandidate>,
+    enabled: Boolean,
+    onSelect: (String?) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val manualLabel = stringResource(R.string.dashboard_exit_node_manual)
+    val advertisedLabel = stringResource(R.string.dashboard_exit_node_advertised)
+
+    Box {
+        SettingsGroup {
+            SettingsItem(
+                icon = Icons.Default.Router,
+                title = stringResource(R.string.dashboard_exit_node),
+                subtitle = current ?: stringResource(R.string.dashboard_exit_node_none),
+                trailing = {
+                    TextButton(onClick = { expanded = true }, enabled = enabled) {
+                        Text(stringResource(R.string.dashboard_exit_node_change))
+                    }
+                },
+            )
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(
+                text = { Text(stringResource(R.string.dashboard_exit_node_none)) },
+                onClick = { expanded = false; onSelect(null) },
+                trailingIcon = { if (current == null) Icon(Icons.Default.Check, contentDescription = null) },
+            )
+            candidates.forEach { candidate ->
+                DropdownMenuItem(
+                    text = {
+                        Column {
+                            Text(candidate.hostname)
+                            Text(
+                                text = if (candidate.advertisesDefaultRoute) {
+                                    "${candidate.virtualIpv4} · $advertisedLabel"
+                                } else {
+                                    candidate.virtualIpv4
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    },
+                    onClick = { expanded = false; onSelect(candidate.virtualIpv4) },
+                    trailingIcon = { if (current == candidate.virtualIpv4) Icon(Icons.Default.Check, contentDescription = null) },
+                )
+            }
+            if (current != null && candidates.none { it.virtualIpv4 == current }) {
+                DropdownMenuItem(
+                    text = {
+                        Column {
+                            Text(current)
+                            Text(
+                                text = manualLabel,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    },
+                    onClick = { expanded = false; onSelect(current) },
+                    trailingIcon = { Icon(Icons.Default.Check, contentDescription = null) },
+                )
+            }
+            if (candidates.isEmpty()) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.dashboard_exit_node_empty)) },
+                    onClick = {},
+                    enabled = false,
                 )
             }
         }
