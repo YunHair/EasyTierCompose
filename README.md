@@ -1,4 +1,13 @@
-# EasyTier Compose
+# EasyTier Plus for Android
+
+> 本仓库是 [originalFactor/EasyTierCompose](https://github.com/originalFactor/EasyTierCompose) 的个人定制分支，
+> 应用显示名 **EasyTier Plus**，包名保持 `cc.ptoe.easytier.compose` 不变。
+>
+> 相对上游的主要改动：
+> - **出口节点生效**：`exit_nodes` 非空时补 `0.0.0.0/0` 默认路由（对齐 Tailscale exit node）
+> - **IPv6 接管**：「启用 IPv6」关闭时把 `::/0` 收进隧道，出口节点模式下同样接管，杜绝本机 IPv6 泄漏
+> - **修复断开后整机断网**：停止时强制注销残留 VPN 配置，不再依赖原生释放 TUN fd
+> - **首屏出口节点选择器**：自动列出网络节点，选择后热重载，无需断开重连
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-android-green.svg)](https://developer.android.com)
@@ -98,7 +107,7 @@ app/src/main/java/cc/ptoe/easytier/compose/
 
 ```bash
 git clone --recurse-submodules <repo-url>
-cd EasyTierCompose
+cd EasyTierPlus-android
 
 # 若已克隆但未拉取 submodule
 git submodule update --init --recursive
@@ -180,8 +189,8 @@ VPN 前台服务的 `PROPERTY_SPECIAL_USE_FGS_SUBTYPE` 标注为 `EasyTier virtu
 本项目基于 [GNU General Public License v3](LICENSE) 发布。
 
 ```
-EasyTier Compose
-Copyright (C) 2026 EasyTier Compose Contributors
+EasyTier Plus (fork of EasyTier Compose)
+Copyright (C) 2026 EasyTier Plus / EasyTier Compose Contributors
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
