@@ -2,7 +2,10 @@ package cc.ptoe.easytier.compose.transport.vpn
 
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.VpnService
+import android.util.Log
 import cc.ptoe.easytier.compose.R
 import androidx.core.content.ContextCompat
 import cc.ptoe.easytier.compose.data.EasyTierProfile
@@ -10,6 +13,7 @@ import cc.ptoe.easytier.compose.data.GlobalSettings
 import cc.ptoe.easytier.compose.data.RuntimeState
 import cc.ptoe.easytier.compose.data.RuntimeStatus
 import cc.ptoe.easytier.compose.transport.RuntimeTransport
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -102,12 +106,58 @@ class VpnTunTransport(
     }
 
     override suspend fun stop() {
+        // 没有建立过接口时无需做残留检测（例如 start() 内部先调一次 stopLocked 清理旧会话）。
+        val hadSession = establishedIpv4Cidr != null || establishedRoutes.isNotEmpty()
         running = false
         establishedIpv4Cidr = null
         establishedRoutes = emptyList()
+        Log.i(TAG, "stop: stopping EasyTierVpnService (hadSession=$hadSession)")
         context.stopService(Intent(context, EasyTierVpnService::class.java))
+        // stopService() 是异步的，而且关键问题在于：TUN fd 通过 setTunFd() 交给了
+        // 原生 EasyTier，原生侧对 fd 另有引用。仅关闭 Java 侧 ParcelFileDescriptor
+        // 时，内核 tun 设备可能仍然存活，VPN 网络配置（0.0.0.0/0 默认路由、DNS
+        // 覆盖）就被保留下来 —— 用户看到的现象就是「断开后整机断网，只有杀掉 App
+        // 进程才恢复」（进程退出才释放原生 fd）。
+        //
+        // 这里不依赖原生层：轮询确认 EasyTier 的 VPN 接口是否真的消失，没消失就
+        // 下发 ACTION_PURGE，让 Service 重新 establish 一个空接口强制注销旧配置。
+        if (!hadSession) {
+            mutableStatus.value = RuntimeStatus.Stopped
+            return
+        }
+        repeat(PURGE_ATTEMPTS) { attempt ->
+            delay(PURGE_INTERVAL_MS)
+            if (!hasOwnVpnInterface()) {
+                Log.i(TAG, "stop: VPN interface released after ${(attempt + 1) * PURGE_INTERVAL_MS}ms")
+                mutableStatus.value = RuntimeStatus.Stopped
+                return
+            }
+            Log.w(TAG, "stop: EasyTier VPN interface still present (attempt ${attempt + 1}/$PURGE_ATTEMPTS), forcing purge")
+            runCatching {
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, EasyTierVpnService::class.java).setAction(EasyTierVpnService.ACTION_PURGE),
+                )
+            }.onFailure { Log.w(TAG, "stop: purge request failed: ${it.message}") }
+        }
         mutableStatus.value = RuntimeStatus.Stopped
     }
+
+    /**
+     * 判断本 App 的 VPN 接口是否仍然挂在系统上。
+     *
+     * 用 fd00::1 作为指纹：EasyTierVpnService.createInterface() 总会给接口加
+     * fd00::1/128，而其他 VPN（Tailscale / Clash 等）不会，因此不会误判。
+     */
+    private fun hasOwnVpnInterface(): Boolean = runCatching {
+        val manager = context.getSystemService(ConnectivityManager::class.java) ?: return false
+        manager.allNetworks.any { network ->
+            val capabilities = manager.getNetworkCapabilities(network) ?: return@any false
+            if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return@any false
+            val linkProperties = manager.getLinkProperties(network) ?: return@any false
+            linkProperties.linkAddresses.any { it.address.hostAddress?.trim() == VPN_MARKER_ADDRESS }
+        }
+    }.getOrDefault(false)
 
     private fun startPrepared(profile: EasyTierProfile, ipv4Cidr: String?, routes: List<String>): RuntimeStatus {
         if (ipv4Cidr == null) return RuntimeStatus(RuntimeState.STARTING, profile.id, profile.tunMode, null, null, null)
@@ -116,6 +166,10 @@ class VpnTunTransport(
     }
 
     private companion object {
+        const val TAG = "VpnTunTransport"
         const val DEFAULT_MTU = 1380
+        const val VPN_MARKER_ADDRESS = "fd00::1"
+        const val PURGE_ATTEMPTS = 4
+        const val PURGE_INTERVAL_MS = 250L
     }
 }

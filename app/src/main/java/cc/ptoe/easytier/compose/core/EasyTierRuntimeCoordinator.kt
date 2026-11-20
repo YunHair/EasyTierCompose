@@ -62,6 +62,9 @@ class EasyTierRuntimeCoordinator private constructor(
         // 用来避开 native 层 "null => 保留全部" 的语义（见 stopNativeInstances）。
         private const val STOP_SENTINEL = "__easytier_stopped__"
 
+        private const val PREFS_NAME = "easytier_runtime"
+        private const val KEY_USER_STOPPED = "user_stopped"
+
         // Process-wide singleton: BootCompletedReceiver and MainActivity must share one
         // coordinator. Two instances would each run their own poll loops and transports
         // against the same global native instance / root daemon, so a stop() from the
@@ -92,6 +95,7 @@ class EasyTierRuntimeCoordinator private constructor(
         if (errors.isNotEmpty()) return@withLock failure(effectiveProfile, errors.values.first().resolve(context))
         val toml = TomlConfigBuilder.build(effectiveProfile, globalSettings)
         stopLocked()
+        markUserStopped(false)
         activeProfile = effectiveProfile
         mutableStatus.value = RuntimeStatus(RuntimeState.STARTING, effectiveProfile.id, effectiveProfile.tunMode, null, null, null)
         return@withLock when (effectiveProfile.tunMode) {
@@ -161,6 +165,14 @@ class EasyTierRuntimeCoordinator private constructor(
         profileLookup: suspend (String) -> EasyTierProfile?,
     ) = mutex.withLock {
         if (activeProfile != null) return@withLock
+        if (isUserStopped()) {
+            // 用户已主动断开。此时若原生实例因为 TUN fd 引用未释放而残留，重新接管会
+            // 立刻把带 0.0.0.0/0 的 VPN 接口再建起来 —— 用户看到的就是“断开后依然断网”。
+            // 这里只做清理，绝不接管。
+            Log.w(TAG, "attachRunningInstance: skipped, user explicitly disconnected; releasing leftovers")
+            stopNativeInstances()
+            return@withLock
+        }
         val raw = runCatching { EasyTierJni.collectNetworkInfos(1) }.getOrNull() ?: return@withLock
         val map = runCatching {
             Json.parseToJsonElement(raw).jsonObject["map"]?.jsonObject
@@ -265,28 +277,45 @@ class EasyTierRuntimeCoordinator private constructor(
         pollJob?.cancelAndJoin()
         pollJob = null
         val profile = activeProfile
+        // 记下“用户主动断开”，阻止 attachRunningInstance 在实例残留时重新接管并
+        // 重建带默认路由的接口（那是断开后再次断网的直接原因）。
+        markUserStopped(true)
+        if (profile != null) mutableStatus.value = mutableStatus.value.copy(state = RuntimeState.STOPPING)
         when (profile?.tunMode) {
             // no_tun sessions started in-process (NO_TUN mode) release the
             // EasyTier instance here; ROOT_TUN sessions always live in the root
             // daemon and are stopped via root.stop() below.
-            TunMode.NO_TUN -> {
-                mutableStatus.value = mutableStatus.value.copy(state = RuntimeState.STOPPING)
-                stopNativeInstances()
-            }
+            TunMode.NO_TUN -> stopNativeInstances()
             TunMode.VPN_SERVICE -> {
-                mutableStatus.value = mutableStatus.value.copy(state = RuntimeState.STOPPING)
-                // 必须先停 native 实例：它持有 VpnService TUN fd 的副本，
-                // 只关 Java 侧 ParcelFileDescriptor 不会让接口消失。
-                stopNativeInstances()
-                ensureNativeStopped(profile)
+                // 顺序至关重要：先把 VPN 接口/默认路由从系统上摘掉，再停 native 实例。
+                // 反序（先停实例、后关接口）时，只要原生层对 TUN fd 的引用还没释放，
+                // 接口就会继续挂着 0.0.0.0/0，用户一直断网 —— 这就是“断开连接后整机
+                // 断网、只能杀进程”的直接原因。vpn.stop() 内部会强制注销 VPN 配置。
                 vpn.stop()
+                stopNativeInstances()
+                awaitNativeStopped(profile)
             }
             TunMode.ROOT_TUN -> root.stop()
-            null -> return mutableStatus.value.takeIf { it.state == RuntimeState.STOPPED } ?: RuntimeStatus.Stopped
+            null -> {
+                // activeProfile 丢失（进程被回收、attach 失败等）但 VPN 可能仍在运行。
+                // 无条件清一遍，避免孤儿 VPN 服务永久劫持流量、造成整机断网。
+                Log.w(TAG, "stopLocked: no active profile, forcing VPN/native teardown")
+                vpn.stop()
+                stopNativeInstances()
+            }
         }
         activeProfile = null
         return RuntimeStatus.Stopped.also { mutableStatus.value = it }
     }
+
+    private fun prefs() = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    private fun markUserStopped(stopped: Boolean) {
+        runCatching { prefs().edit().putBoolean(KEY_USER_STOPPED, stopped).apply() }
+    }
+
+    private fun isUserStopped(): Boolean =
+        runCatching { prefs().getBoolean(KEY_USER_STOPPED, false) }.getOrDefault(false)
 
     private fun pollVpn() {
         pollJob?.cancel()
@@ -427,23 +456,19 @@ class EasyTierRuntimeCoordinator private constructor(
      * 校验实例确实已停止。若重试后仍在运行（TUN fd 仍被持有 -> 会持续黑洞流量），
      * 结束本进程兜底释放所有 fd，避免手机持续断网（这也是用户唯一可行的自救手段）。
      */
-    private suspend fun ensureNativeStopped(profile: EasyTierProfile) {
+    private suspend fun awaitNativeStopped(profile: EasyTierProfile) {
         repeat(4) { attempt ->
             val alive = runCatching { EasyTierJni.collectNetworkInfos(1)?.networkInfo(profile.id) }
                 .getOrNull() != null
-            if (!alive) return
-            Log.w(TAG, "instance ${profile.id} still alive after stop (attempt ${attempt + 1})")
+            if (!alive) {
+                Log.i(TAG, "native instance ${profile.id} stopped (attempt ${attempt + 1})")
+                return
+            }
+            Log.w(TAG, "native instance ${profile.id} still alive (attempt ${attempt + 1}), retrying retain")
             stopNativeInstances()
-            delay(300)
+            delay(250)
         }
-        // 只有"出口节点模式"才存在整机断网风险（默认路由仍指向已死的 TUN）；
-        // 普通模式的残留实例最多影响虚拟网段，不必付出杀进程的代价。
-        if (profile.exitNodes.any { it.isNotBlank() }) {
-            Log.e(TAG, "instance ${profile.id} refuses to stop; killing process to release TUN fd")
-            android.os.Process.killProcess(android.os.Process.myPid())
-        } else {
-            Log.e(TAG, "instance ${profile.id} still running after stop; leaving it (no default route installed)")
-        }
+        Log.w(TAG, "native instance ${profile.id} survived stop; VPN config already revoked so traffic is not blackholed")
     }
 
     private fun nativeError(@StringRes fallbackRes: Int) = EasyTierJni.getLastError() ?: context.getString(fallbackRes)

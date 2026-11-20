@@ -19,9 +19,21 @@ import cc.ptoe.easytier.compose.core.EasyTierJni
 
 class EasyTierVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
+    // 是否成功创建过接口。用于 onDestroy 判断要不要去注销残留的 VPN 配置。
+    private var everEstablished = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForegroundCompat()
+        if (intent?.action == ACTION_PURGE) {
+            // 兜底清理：上层检测到 VPN 接口在 stopService 之后仍然存在时下发。
+            Log.w(TAG, "onStartCommand: purge requested")
+            closeTunnel()
+            // force=true：新起的 Service 实例没有 everEstablished 记录，不能因为
+            // 这个标志为 false 就跳过注销（那正是残留接口没被清掉的原因）。
+            releaseVpnConfig(force = true)
+            stopSelf(startId)
+            return Service.START_NOT_STICKY
+        }
         val command = intent ?: return stopAndExit(startId)
         val instanceName = command.getStringExtra(EXTRA_INSTANCE_NAME) ?: return stopAndExit(startId, "missing instance name")
         val ipv4Cidr = command.getStringExtra(EXTRA_IPV4_CIDR) ?: return stopAndExit(startId, "missing ipv4 cidr")
@@ -37,6 +49,7 @@ class EasyTierVpnService : VpnService() {
             Log.e(TAG, "createInterface failed: ${e.message}", e)
             return stopAndExit(startId, "createInterface: ${e.message}")
         }
+        everEstablished = true
         val result = EasyTierJni.setTunFd(instanceName, requireNotNull(vpnInterface).fd)
         if (result != 0) {
             Log.e(TAG, "setTunFd failed: result=$result")
@@ -64,13 +77,53 @@ class EasyTierVpnService : VpnService() {
     }
 
     override fun onRevoke() {
+        Log.w(TAG, "onRevoke: VPN permission revoked by system/user")
         closeTunnel()
+        releaseVpnConfig()
         super.onRevoke()
     }
 
     override fun onDestroy() {
+        Log.i(TAG, "onDestroy: tearing down tunnel (everEstablished=$everEstablished)")
         closeTunnel()
+        // 刻意不在这里 retainNetworkInstance(null)：热重载（切换出口节点 =
+        // coordinator.stop() + start()）时，旧 Service 的 onDestroy 可能晚于
+        // 新会话的 runNetworkInstance 执行，会把刚起来的实例误杀。
+        // 停止实例的职责只在 EasyTierRuntimeCoordinator.stopLocked()，
+        // 这里只负责把 VPN 配置从系统上注销。
+        releaseVpnConfig(force = everEstablished)
         super.onDestroy()
+    }
+
+    /**
+     * 强制让 system_server 注销本条 VPN 配置（默认路由 + DNS 覆盖）。
+     *
+     * 为什么需要这一步：`Builder.establish()` 返回的 fd 会通过
+     * `EasyTierJni.setTunFd()` 交给原生 EasyTier。原生侧对 fd 另有引用（dup 语义），
+     * 因此仅关闭 Java 层的 [ParcelFileDescriptor] 时，内核里的 tun 设备可能仍然存在，
+     * VPN 网络配置（0.0.0.0/0 默认路由、DNS 覆盖）就可能继续生效 —— 表现为
+     * “断开连接后整机断网、只有杀掉 App 进程才恢复”。
+     *
+     * 这里重新 establish 一个「无路由、无 DNS」的最小接口：
+     * frameworks 的 Vpn.establish() 会先 jniClose 并注销上一条 VPN 配置，然后才挂新接口。
+     * 新接口不声明任何 route/dns，随即关闭，系统网络立即回到物理网卡。
+     * 整个过程不依赖原生层是否释放了旧 fd。
+     */
+    private fun releaseVpnConfig(force: Boolean = false) {
+        if (!everEstablished && !force) return
+        everEstablished = false
+        runCatching {
+            Builder()
+                .setSession(getString(R.string.vpn_session_name))
+                .setMtu(1280)
+                .addAddress(PURGE_PROBE_ADDRESS, 32)
+                .establish()
+        }.onSuccess { probe ->
+            probe?.close()
+            Log.i(TAG, "releaseVpnConfig: stale VPN configuration revoked")
+        }.onFailure {
+            Log.w(TAG, "releaseVpnConfig failed: ${it.message}")
+        }
     }
 
     private fun createInterface(ipv4Cidr: String, routes: Array<String>, dns: Boolean, mtu: Int, disableIpv6: Boolean): ParcelFileDescriptor {
@@ -124,9 +177,12 @@ class EasyTierVpnService : VpnService() {
     }
 
     private fun closeTunnel() {
-        vpnInterface?.close()
+        val hadInterface = vpnInterface != null
+        runCatching { vpnInterface?.close() }
+            .onFailure { Log.w(TAG, "closeTunnel: close failed: ${it.message}") }
         vpnInterface = null
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        Log.i(TAG, "closeTunnel: hadInterface=$hadInterface")
     }
 
     private fun notification() = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -172,6 +228,9 @@ class EasyTierVpnService : VpnService() {
         private const val FALLBACK_DNS = "223.5.5.5"
         private const val DEFAULT_ROUTE_V4 = "0.0.0.0/0"
         private const val IPV6_DEFAULT_ROUTE = "::"
+        // 注销 VPN 配置时用的探针地址（不声明任何路由/DNS，不会截走流量）。
+        private const val PURGE_PROBE_ADDRESS = "10.255.255.254"
+        const val ACTION_PURGE = "cc.ptoe.easytier.compose.PURGE"
 
         fun intent(context: Context, instanceName: String, ipv4Cidr: String, routes: List<String>, dns: Boolean, mtu: Int, disableIpv6: Boolean) =
             Intent(context, EasyTierVpnService::class.java)
